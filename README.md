@@ -48,7 +48,7 @@ import _ from 'lodash-es'
 import wip from './src/WIpProxy.mjs'
 
 let wo = wip({
-    // tar: `https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT`,
+    // tar: `https://www.google.com`,
     withServer: true,
     serverPort: 9000,
     serverCorsOrigins: ['*'],

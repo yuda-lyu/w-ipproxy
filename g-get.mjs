@@ -20,4 +20,4 @@ wo.on('change', (proxies) => {
 })
 
 
-//node --experimental-modules g-get.mjs
+//node g-get.mjs

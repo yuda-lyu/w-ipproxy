@@ -25,4 +25,4 @@ wo.on('change', (proxies) => {
 //browser view: http://localhost:9000/getProxies
 
 
-//node --experimental-modules g-srv.mjs
+//node g-srv.mjs

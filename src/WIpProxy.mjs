@@ -12,6 +12,7 @@ import isestr from 'wsemi/src/isestr.mjs'
 import ispint from 'wsemi/src/ispint.mjs'
 import isbol from 'wsemi/src/isbol.mjs'
 import isearr from 'wsemi/src/isearr.mjs'
+import iseobj from 'wsemi/src/iseobj.mjs'
 import cint from 'wsemi/src/cint.mjs'
 import waitFun from 'wsemi/src/waitFun.mjs'
 import provideServer from './provideServer.mjs'
@@ -159,12 +160,31 @@ function WIpProxy(opt = {}) {
         return ps
     }
 
+    let b_getProxies = false
     async function _getProxies() {
         // console.log('call getProxies...')
-        prxsRaw = await _getProxiesCore(src)
-            .catch(() => {})
-        // console.log('call getProxies fin')
-        ev.emit('getRawProxies', prxsRaw)
+
+        let core = async() => {
+
+            //get
+            prxsRaw = await _getProxiesCore(src)
+
+            //emit
+            ev.emit('getRawProxies', prxsRaw)
+
+        }
+
+        //core
+        if (b_getProxies) {
+            return
+        }
+        b_getProxies = true
+        await core()
+            .catch(() => {}) //吃掉錯誤
+            .finally(() => {
+                b_getProxies = false
+            })
+
     }
 
     async function _testProxyCore(host, port, url) {
@@ -239,18 +259,31 @@ function WIpProxy(opt = {}) {
         let psValid = []
         let psInvalid = []
         each(rrs, (v) => {
+
+            //be
+            let p = get(v, 'value.p', null)
+            let be = iseobj(p) && isestr(get(p, 'proxy'))
+
+            //check
+            if (!be) {
+                return true //跳出換下一個
+            }
+
+            //b
             let status = get(v, 'status', '')
             let b1 = status === 'fulfilled'
             let state = get(v, 'value.state', '')
             let b2 = state === 'success'
             let b = b1 && b2
-            let p = get(v, 'value.p', null)
+
+            //push
             if (b) {
                 psValid.push(p)
             }
             else {
                 psInvalid.push(p)
             }
+
         })
 
         return {
@@ -259,19 +292,65 @@ function WIpProxy(opt = {}) {
         }
     }
 
+    let b_testProxies = false
     async function _testProxies() {
         // console.log('call testProxies...')
-        let r = await _testProxiesCore(prxsRaw)
-        each(r.psValid, (p) => {
-            kpPrx[p.proxy] = p
-            ev.emit('add', p, values(kpPrx))
-        })
-        each(r.psInvalid, (p) => {
-            delete kpPrx[p.proxy]
-            ev.emit('delete', p, values(kpPrx))
-        })
-        ev.emit('change', values(kpPrx))
-        // console.log('call testProxies fin')
+
+        let core = async() => {
+
+            //get
+            let r = await _testProxiesCore(prxsRaw)
+
+            //emit add
+            each(r.psValid, (p) => {
+                kpPrx[p.proxy] = p
+                ev.emit('add', p, values(kpPrx))
+            })
+
+            //emit delete
+            each(r.psInvalid, (p) => {
+                delete kpPrx[p.proxy]
+                ev.emit('delete', p, values(kpPrx))
+            })
+
+            //emit change
+            ev.emit('change', values(kpPrx))
+
+        }
+
+        //core
+        if (b_testProxies) {
+            return
+        }
+        b_testProxies = true
+        await core()
+            .catch(() => {}) //吃掉錯誤
+            .finally(() => {
+                b_testProxies = false
+            })
+
+    }
+
+    function init() {
+
+        //取得代理清單
+        if (true) {
+            _getProxies()
+            setInterval(() => {
+                _getProxies()
+            }, timeGetProxies)
+        }
+
+        //過濾出有效代理清單, 延遲3s觸發, 給時間抓取
+        if (true) {
+            setTimeout(() => {
+                _testProxies()
+                setInterval(() => {
+                    _testProxies()
+                }, timeTestProxies)
+            }, 3000)
+        }
+
     }
 
     async function getProxies() {
@@ -286,23 +365,6 @@ function WIpProxy(opt = {}) {
     //ev
     let ev = evem()
 
-    //取得代理清單
-    if (true) {
-        _getProxies()
-        setInterval(() => {
-            _getProxies()
-        }, timeGetProxies)
-    }
-
-    //過濾出有效代理清單, 延遲3s觸發, 給時間抓取
-    setTimeout(() => {
-        _testProxies()
-        setInterval(() => {
-            _testProxies()
-                .catch(() => {})
-        }, timeTestProxies)
-    }, 3000)
-
     //withServer
     if (withServer) {
         provideServer(getProxies, {
@@ -312,8 +374,17 @@ function WIpProxy(opt = {}) {
         })
     }
 
+    async function getProxiesOnce() {
+        await _getProxies()
+        await _testProxies()
+        let ps = await getProxies()
+        return ps
+    }
+
     //save
+    ev.init = init
     ev.getProxies = getProxies
+    ev.getProxiesOnce = getProxiesOnce
 
     return ev
 }

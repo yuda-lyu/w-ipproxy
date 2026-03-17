@@ -5,6 +5,7 @@ import wip from './src/WIpProxy.mjs'
 let wo = wip({
     // tar: `https://www.google.com`,
 })
+wo.init()
 wo.on('getRawProxies', (prxsRaw) => {
     console.log(`已抓取公開代理共 ${_.size(prxsRaw)} 個...`)
 })
@@ -20,4 +21,4 @@ wo.on('change', (proxies) => {
 })
 
 
-//node g-get.mjs
+//node g-getByTimer.mjs

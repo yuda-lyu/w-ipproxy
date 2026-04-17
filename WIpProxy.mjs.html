@@ -74,6 +74,8 @@ import provideServer from './provideServer.mjs'
  * @param {String} [opt.tar='https://httpbin.org/ip'] 輸入檢測目標網址字串，預設'https://httpbin.org/ip'
  * @param {Integer} [opt.timeGetProxies=30*1000] 輸入輪循抓取代理伺服器時間間隔整數，單位ms，預設30*1000
  * @param {Integer} [opt.timeTestProxies=60*1000] 輸入輪循測試代理伺服器時間間隔整數，單位ms，預設60*1000
+ * @param {Boolean} [opt.anonymityCheck=true] 輸入是否對代理做匿名性檢測布林值，開啟時會先打https://httpbin.org/ip驗證代理不會將本機真實IP透過X-Forwarded-For等方式洩漏給目標端，預設true
+ * @param {Integer} [opt.anonymityCheckRepeats=2] 輸入匿名性檢測重複次數整數，用以偵測負載平衡型代理的機率性洩漏，任一次洩漏即判定失敗，預設2
  * @param {Boolean} [opt.withServer=false] 輸入是否創建供數據供給伺服器布林值，預設false
  * @param {Integer} [opt.serverPort=8080] 輸入創建伺服器所用port整數，預設8080
  * @param {String} [opt.serverApiName='getProxies'] 輸入供給數據API名稱字串，預設'getProxies'
@@ -118,7 +120,7 @@ function WIpProxy(opt = {}) {
         `&amp;timeout=5000` +
         // `&amp;country=${join(['tw', 'cn', 'hk', 'jp', 'kr', 'sg', 'my', 'in', 'id', 'th', 'vn'])}` +
         // `&amp;ssl=yes` +
-        `&amp;anonymity=all`
+        `&amp;anonymity=elite` //elite匿名代理, all會使用X-Forwarded-For儲存原本ip導致被識別
     }
 
     //tar
@@ -140,6 +142,19 @@ function WIpProxy(opt = {}) {
         timeTestProxies = 60 * 1000 //1min
     }
     timeTestProxies = cint(timeTestProxies)
+
+    //anonymityCheck
+    let anonymityCheck = get(opt, 'anonymityCheck')
+    if (!isbol(anonymityCheck)) {
+        anonymityCheck = true
+    }
+
+    //anonymityCheckRepeats
+    let anonymityCheckRepeats = get(opt, 'anonymityCheckRepeats')
+    if (!ispint(anonymityCheckRepeats)) {
+        anonymityCheckRepeats = 2
+    }
+    anonymityCheckRepeats = cint(anonymityCheckRepeats)
 
     //withServer
     let withServer = get(opt, 'withServer')
@@ -169,6 +184,71 @@ function WIpProxy(opt = {}) {
     //prxsRaw, kpPrx
     let prxsRaw = []
     let kpPrx = {}
+
+    //myRealIp: 本機真實公網IP, 用於匿名性檢測時比對代理egress是否洩漏
+    let myRealIp = ''
+    let myRealIpReady = false
+    let myRealIpPm = null
+    async function _fetchMyRealIp() {
+        if (myRealIpReady) {
+            return
+        }
+        if (!myRealIpPm) {
+            myRealIpPm = (async () => {
+                try {
+                    let res = await axios.get('https://httpbin.org/ip', { timeout: 10000 })
+                    let origin = get(res, 'data.origin', '')
+                    if (isestr(origin)) {
+                        //origin可能為"1.2.3.4"或"1.2.3.4:port", 取首個逗號前且去port
+                        myRealIp = origin.split(',')[0].trim().split(':')[0]
+                    }
+                }
+                catch (err) {
+                    //取不到就算了, 匿名性檢查會自動跳過
+                }
+                myRealIpReady = true
+            })()
+        }
+        await myRealIpPm
+    }
+
+    async function _anonymityCheckCore(host, port) {
+        if (!anonymityCheck) {
+            return { ok: true }
+        }
+        if (!isestr(myRealIp)) {
+            return { ok: true } //沒抓到自己IP就無從比對, 放行
+        }
+        let agent = new https.Agent({ rejectUnauthorized: false })
+        for (let i = 0; i &lt; anonymityCheckRepeats; i++) {
+            try {
+                let res = await axios.get('https://httpbin.org/ip', {
+                    proxy: { host, port, protocol: 'http' },
+                    httpsAgent: agent,
+                    timeout: 5000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
+                        'Accept': 'application/json',
+                    },
+                    validateStatus: () => true,
+                })
+                if (res.status !== 200) {
+                    return { ok: false, reason: `anonymity status[${res.status}]` }
+                }
+                let origin = get(res, 'data.origin', '')
+                if (!isestr(origin)) {
+                    return { ok: false, reason: 'anonymity non-json' }
+                }
+                if (origin.indexOf(myRealIp) >= 0) {
+                    return { ok: false, reason: `leaks real IP` }
+                }
+            }
+            catch (err) {
+                return { ok: false, reason: trim(err.message || '') }
+            }
+        }
+        return { ok: true }
+    }
 
     async function _getProxiesCore(src) {
         let ps = []
@@ -247,6 +327,12 @@ function WIpProxy(opt = {}) {
                     port,
                 },
             }
+        }
+
+        //匿名性預檢: 先確認代理不會透過X-Forwarded-For等洩漏本機真實IP
+        let ac = await _anonymityCheckCore(host, port)
+        if (!ac.ok) {
+            return ret('error', ac.reason)
         }
 
         //r
@@ -344,6 +430,9 @@ function WIpProxy(opt = {}) {
         // console.log('call testProxies...')
 
         let core = async() => {
+
+            //確保本機真實IP已取得, 供匿名性檢查比對
+            await _fetchMyRealIp()
 
             //get
             let r = await _testProxiesCore(prxsRaw)
@@ -452,7 +541,7 @@ export default WIpProxy
 <br class="clear">
 
 <footer>
-    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 4.0.2</a> on Tue Mar 17 2026 21:42:27 GMT+0800 (台北標準時間) using the <a href="https://github.com/clenemt/docdash">docdash</a> theme.
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 4.0.5</a> on Fri Apr 17 2026 13:21:29 GMT+0800 (台北標準時間) using the <a href="https://github.com/clenemt/docdash">docdash</a> theme.
 </footer>
 
 <script>prettyPrint();</script>

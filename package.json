@@ -1,6 +1,6 @@
 {
   "name": "w-ipproxy",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "main": "dist/w-ipproxy.umd.js",
   "dependencies": {
     "@hapi/hapi": "^21.4.8",

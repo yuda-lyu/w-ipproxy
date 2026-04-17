@@ -1,20 +1,17 @@
 import rollupFiles from 'w-package-tools/src/rollupFiles.mjs'
 import getFiles from 'w-package-tools/src/getFiles.mjs'
-import w from 'wsemi'
 
 
 let fdSrc = './src'
 let fdTar = './dist'
-let fns = getFiles(fdSrc)
-fns = fns.filter((v) => {
-    return w.strleft(v, 1) === 'W'
-})
+
 
 rollupFiles({
-    fns,
+    fns: 'WIpProxy.mjs',
     fdSrc,
     fdTar,
-    nameDistType: 'kebabCase',
+    hookNameDist: () => 'w-ipproxy',
+    // nameDistType: 'kebabCase', //直接由hookNameDist給予
     globals: {
         '@hapi/hapi': '@hapi/hapi',
         '@hapi/inert': '@hapi/inert',

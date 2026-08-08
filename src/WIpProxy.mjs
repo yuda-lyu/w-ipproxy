@@ -138,6 +138,40 @@ function WIpProxy(opt = {}) {
     let prxsRaw = []
     let kpPrx = {}
 
+    //_normalizeIp: 正規化單一IP字串, 去除[]包裹, ipv4之port, 及ipv4-mapped-ipv6之'::ffff:'前綴
+    function _normalizeIp(v) {
+        let s = trim(v)
+        if (s === '') {
+            return ''
+        }
+        if (s[0] === '[') {
+            //形如'[::1]:8080'或'[2001:db8::1]'
+            let k = s.indexOf(']')
+            if (k > 0) {
+                s = s.slice(1, k)
+            }
+        }
+        else if (s.split(':').length === 2) {
+            //僅單一冒號才視為'1.2.3.4:port', 多冒號為ipv6不可截斷
+            s = s.split(':')[0]
+        }
+        //ipv4-mapped-ipv6, 如'::ffff:1.2.3.4', 統一還原為ipv4
+        let m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i)
+        if (m) {
+            s = m[1]
+        }
+        return s
+    }
+
+    //_originHasIp: 檢查origin(可能為'ip1, ip2, ...')逐段正規化後是否含有指定IP
+    function _originHasIp(origin, ip) {
+        if (!isestr(ip)) {
+            return false
+        }
+        let vs = map(sep(origin, ','), (v) => _normalizeIp(v))
+        return vs.indexOf(ip) >= 0
+    }
+
     //myRealIp: 本機真實公網IP, 用於匿名性檢測時比對代理egress是否洩漏
     let myRealIp = ''
     let myRealIpReady = false
@@ -152,8 +186,8 @@ function WIpProxy(opt = {}) {
                     let res = await axios.get('https://httpbin.org/ip', { timeout: 10000 })
                     let origin = get(res, 'data.origin', '')
                     if (isestr(origin)) {
-                        //origin可能為"1.2.3.4"或"1.2.3.4:port", 取首個逗號前且去port
-                        myRealIp = origin.split(',')[0].trim().split(':')[0]
+                        //origin可能為"1.2.3.4", "1.2.3.4:port", 或"::ffff:1.2.3.4"(部分環境如雲端runner為ipv4-mapped-ipv6), 取首個逗號前再正規化
+                        myRealIp = _normalizeIp(sep(origin, ',')[0])
                     }
                 }
                 catch (err) {
@@ -192,7 +226,7 @@ function WIpProxy(opt = {}) {
                 if (!isestr(origin)) {
                     return { ok: false, reason: 'anonymity non-json' }
                 }
-                if (origin.indexOf(myRealIp) >= 0) {
+                if (_originHasIp(origin, myRealIp)) {
                     return { ok: false, reason: `leaks real IP` }
                 }
             }

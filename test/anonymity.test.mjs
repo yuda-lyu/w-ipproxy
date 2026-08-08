@@ -4,6 +4,37 @@ import https from 'https'
 import wip from '../src/WIpProxy.mjs'
 
 
+//正規化單一IP字串, 去除[]包裹, ipv4之port, 及ipv4-mapped-ipv6之'::ffff:'前綴
+function normalizeIp(v) {
+    let s = String(v || '').trim()
+    if (s === '') {
+        return ''
+    }
+    if (s[0] === '[') {
+        let k = s.indexOf(']')
+        if (k > 0) {
+            s = s.slice(1, k)
+        }
+    }
+    else if (s.split(':').length === 2) {
+        s = s.split(':')[0]
+    }
+    let m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i)
+    if (m) {
+        s = m[1]
+    }
+    return s
+}
+
+//檢查origin(可能為'ip1, ip2, ...')逐段正規化後是否含有指定IP
+function originHasIp(origin, ip) {
+    if (ip === '') {
+        return false
+    }
+    return String(origin).split(',').map((v) => normalizeIp(v)).indexOf(ip) >= 0
+}
+
+
 describe('anonymity (elite + anonymityCheck)', function() {
     this.timeout(240 * 1000) //4min, 因為getProxiesOnce加上獨立leak驗證本身就耗時
 
@@ -12,10 +43,10 @@ describe('anonymity (elite + anonymityCheck)', function() {
 
     before(async function() {
 
-        //取本機真實公網IP
+        //取本機真實公網IP, 各環境格式不一(如雲端runner為'::ffff:1.2.3.4'), 須正規化後才可比對
         try {
             let r = await axios.get('https://httpbin.org/ip', { timeout: 10000 })
-            myIp = r.data?.origin || ''
+            myIp = normalizeIp(String(r.data?.origin || '').split(',')[0])
         }
         catch (err) {
             this.skip()
@@ -57,7 +88,7 @@ describe('anonymity (elite + anonymityCheck)', function() {
                     return { proxy: p.proxy, ok: true, reason: 'non-json, ignored' }
                 }
                 //回傳origin含本機真實IP即代表該代理洩漏
-                let leaks = origin.indexOf(myIp) >= 0
+                let leaks = originHasIp(origin, myIp)
                 return { proxy: p.proxy, ok: !leaks, origin }
             }
             catch (err) {
@@ -112,7 +143,7 @@ describe('anonymity (elite + anonymityCheck)', function() {
                 }
                 let bad = []
                 for (let k of LEAK_IP_HEADERS) {
-                    if (k in hs && hs[k].indexOf(myIp) >= 0) {
+                    if (k in hs && originHasIp(hs[k], myIp)) {
                         bad.push(`${k}=${hs[k]}`)
                     }
                 }

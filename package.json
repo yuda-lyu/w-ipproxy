@@ -1,14 +1,14 @@
 {
   "name": "w-ipproxy",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "main": "dist/w-ipproxy.umd.js",
   "dependencies": {
     "@hapi/hapi": "^21.4.8",
     "axios": "^1.13.6",
-    "wsemi": "^1.8.77"
+    "wsemi": "^1.8.78"
   },
   "devDependencies": {
-    "w-package-tools": "^1.1.13"
+    "w-package-tools": "^1.1.14"
   },
   "scripts": {
     "test": "mocha --parallel --timeout 60000",

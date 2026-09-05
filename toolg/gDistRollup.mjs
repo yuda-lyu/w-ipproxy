@@ -16,11 +16,15 @@ rollupFiles({
         '@hapi/hapi': '@hapi/hapi',
         '@hapi/inert': '@hapi/inert',
         'https': 'https',
+        'http': 'http',
+        'net': 'net',
     },
     external: [
         '@hapi/hapi',
         '@hapi/inert',
         'https',
+        'http',
+        'net',
     ],
 })
 

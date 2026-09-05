@@ -1,10 +1,10 @@
 {
   "name": "w-ipproxy",
-  "version": "1.0.18",
+  "version": "1.0.19",
   "main": "dist/w-ipproxy.umd.js",
   "dependencies": {
-    "@hapi/hapi": "^21.4.8",
-    "axios": "^1.13.6",
+    "@hapi/hapi": "^21.4.10",
+    "axios": "^1.20.0",
     "wsemi": "^1.8.84"
   },
   "devDependencies": {

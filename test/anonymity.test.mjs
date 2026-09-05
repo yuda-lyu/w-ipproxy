@@ -19,19 +19,19 @@ function normalizeIp(v) {
     else if (s.split(':').length === 2) {
         s = s.split(':')[0]
     }
-    let m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i)
+    let m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/i)
     if (m) {
         s = m[1]
     }
     return s
 }
 
-//檢查origin(可能為'ip1, ip2, ...')逐段正規化後是否含有指定IP
+//檢查origin或標頭值(如'ip1, ip2', 'for=1.2.3.4;proto=https')內是否含有指定IP, 以IP可用字元之連續段切token後逐一正規化精確比對
 function originHasIp(origin, ip) {
     if (ip === '') {
         return false
     }
-    return String(origin).split(',').map((v) => normalizeIp(v)).indexOf(ip) >= 0
+    return String(origin).split(/[^0-9a-fA-F:.[\]]+/).map((v) => normalizeIp(v)).indexOf(ip) >= 0
 }
 
 

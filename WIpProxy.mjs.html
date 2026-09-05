@@ -47,6 +47,8 @@
         <article>
             <pre class="prettyprint source linenums"><code>import axios from 'axios'
 import https from 'https'
+import http from 'http'
+import net from 'net'
 import get from 'lodash-es/get.js'
 import size from 'lodash-es/size.js'
 import each from 'lodash-es/each.js'
@@ -61,8 +63,18 @@ import isbol from 'wsemi/src/isbol.mjs'
 import isearr from 'wsemi/src/isearr.mjs'
 import iseobj from 'wsemi/src/iseobj.mjs'
 import cint from 'wsemi/src/cint.mjs'
+import cstr from 'wsemi/src/cstr.mjs'
 import waitFun from 'wsemi/src/waitFun.mjs'
 import provideServer from './provideServer.mjs'
+
+
+//_reqTimeout: axios 1.20+ 對經proxy之請求其內建timeout不生效(實測連不上之代理會卡到系統TCP connect timeout約21s而非設定值, 直連則正常), 大量無效代理逐一卡死會使整體檢測逾時; 故經proxy之請求一律附加AbortSignal.timeout強制中斷, 另保留timeout供直連情形與未來相容
+function _reqTimeout(ms) {
+    return {
+        timeout: ms,
+        signal: AbortSignal.timeout(ms),
+    }
+}
 
 
 /**
@@ -74,13 +86,14 @@ import provideServer from './provideServer.mjs'
  * @param {String} [opt.tar='https://httpbin.org/ip'] 輸入檢測目標網址字串，預設'https://httpbin.org/ip'
  * @param {Integer} [opt.timeGetProxies=30*1000] 輸入輪循抓取代理伺服器時間間隔整數，單位ms，預設30*1000
  * @param {Integer} [opt.timeTestProxies=60*1000] 輸入輪循測試代理伺服器時間間隔整數，單位ms，預設60*1000
- * @param {Boolean} [opt.anonymityCheck=true] 輸入是否對代理做匿名性檢測布林值，開啟時會先打https://httpbin.org/ip驗證代理不會將本機真實IP透過X-Forwarded-For等方式洩漏給目標端，預設true
- * @param {Integer} [opt.anonymityCheckRepeats=2] 輸入匿名性檢測重複次數整數，用以偵測負載平衡型代理的機率性洩漏，任一次洩漏即判定失敗，預設2
+ * @param {Boolean} [opt.anonymityCheck=true] 輸入是否對代理做匿名性檢測布林值，開啟時會先查詢本機真實公網IP(依序嘗試httpbin.org、ipify、checkip.amazonaws.com、icanhazip.com)，再透過代理打https://httpbin.org/get驗證目標端所見之origin與X-Forwarded-For、X-Real-IP、Forwarded等標頭皆不含本機真實IP，且不帶Via、Proxy-Connection等暴露代理存在之標頭；若本機真實IP查詢全部失敗則視為無法驗證，該回合所有代理皆不放行(fail-closed)，預設true
+ * @param {Integer} [opt.anonymityCheckRepeats=5] 輸入匿名性檢測重複次數整數，各次以獨立連線送出並於時間上分散(間隔anonymityCheckInterval)，用以偵測負載平衡型代理呈時間窗之機率性洩漏，任一次洩漏即判定失敗，預設5
+ * @param {Integer} [opt.anonymityCheckInterval=2000] 輸入匿名性檢測各次之間隔時間整數，單位ms，預設2000
  * @param {Boolean} [opt.withServer=false] 輸入是否創建供數據供給伺服器布林值，預設false
  * @param {Integer} [opt.serverPort=8080] 輸入創建伺服器所用port整數，預設8080
  * @param {String} [opt.serverApiName='getProxies'] 輸入供給數據API名稱字串，預設'getProxies'
  * @param {Array} [opt.serverCorsOrigins=['*']] 輸入允許跨域網域陣列，若給予['*']代表允許全部，預設['*']
- * @returns {Object} 回傳事件物件，提供函數getProxies，可監聽事件getRawProxies、add、delete、change
+ * @returns {Object} 回傳事件物件，提供函數getProxies(等待至有有效代理)與getProxiesOnce(抓取並檢測一回合後回傳當前有效代理，可能為空陣列)，可監聽事件getRawProxies、add、delete、change
  * @example
  *
  * import _ from 'lodash-es'
@@ -152,9 +165,16 @@ function WIpProxy(opt = {}) {
     //anonymityCheckRepeats
     let anonymityCheckRepeats = get(opt, 'anonymityCheckRepeats')
     if (!ispint(anonymityCheckRepeats)) {
-        anonymityCheckRepeats = 2
+        anonymityCheckRepeats = 5
     }
     anonymityCheckRepeats = cint(anonymityCheckRepeats)
+
+    //anonymityCheckInterval
+    let anonymityCheckInterval = get(opt, 'anonymityCheckInterval')
+    if (!ispint(anonymityCheckInterval)) {
+        anonymityCheckInterval = 2000 //2s
+    }
+    anonymityCheckInterval = cint(anonymityCheckInterval)
 
     //withServer
     let withServer = get(opt, 'withServer')
@@ -202,22 +222,30 @@ function WIpProxy(opt = {}) {
             //僅單一冒號才視為'1.2.3.4:port', 多冒號為ipv6不可截斷
             s = s.split(':')[0]
         }
-        //ipv4-mapped-ipv6, 如'::ffff:1.2.3.4', 統一還原為ipv4
-        let m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i)
+        //ipv4-mapped-ipv6, 如'::ffff:1.2.3.4'或無括號帶port之'::ffff:1.2.3.4:5678', 統一還原為ipv4
+        let m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/i)
         if (m) {
             s = m[1]
         }
         return s
     }
 
-    //_originHasIp: 檢查origin(可能為'ip1, ip2, ...')逐段正規化後是否含有指定IP
+    //_originHasIp: 檢查origin或標頭值(如'ip1, ip2', 'for=1.2.3.4;proto=https', '"[::1]:443"')內是否含有指定IP, 以IP可用字元之連續段切token後逐一正規化精確比對
     function _originHasIp(origin, ip) {
-        if (!isestr(ip)) {
+        if (!isestr(ip) || !isestr(origin)) {
             return false
         }
-        let vs = map(sep(origin, ','), (v) => _normalizeIp(v))
+        let vs = map(origin.split(/[^0-9a-fA-F:.[\]]+/), (v) => _normalizeIp(v))
         return vs.indexOf(ip) >= 0
     }
+
+    //myRealIpSrcs: 查詢本機真實公網IP之來源, 依序嘗試, 任一成功即止, 避免單一服務(httpbin.org)逾時或限流時匿名性檢測失去比對基準
+    let myRealIpSrcs = [
+        { url: 'https://httpbin.org/ip', parse: (data) => get(data, 'origin', '') },
+        { url: 'https://api.ipify.org?format=json', parse: (data) => get(data, 'ip', '') },
+        { url: 'https://checkip.amazonaws.com', parse: (data) => data },
+        { url: 'https://icanhazip.com', parse: (data) => data },
+    ]
 
     //myRealIp: 本機真實公網IP, 用於匿名性檢測時比對代理egress是否洩漏
     let myRealIp = ''
@@ -229,16 +257,37 @@ function WIpProxy(opt = {}) {
         }
         if (!myRealIpPm) {
             myRealIpPm = (async () => {
-                try {
-                    let res = await axios.get('https://httpbin.org/ip', { timeout: 10000 })
-                    let origin = get(res, 'data.origin', '')
-                    if (isestr(origin)) {
-                        //origin可能為"1.2.3.4", "1.2.3.4:port", 或"::ffff:1.2.3.4"(部分環境如雲端runner為ipv4-mapped-ipv6), 取首個逗號前再正規化
-                        myRealIp = _normalizeIp(sep(origin, ',')[0])
+                //最多兩輪, 每輪依序嘗試各來源
+                for (let round = 0; round &lt; 2 &amp;&amp; !isestr(myRealIp); round++) {
+                    for (let k = 0; k &lt; myRealIpSrcs.length; k++) {
+                        let { url, parse } = myRealIpSrcs[k]
+                        try {
+                            let res = await axios.get(url, { timeout: 10000, responseType: 'text', transformResponse: [(v) => v] })
+                            let raw = trim(get(res, 'data', ''))
+                            let data = raw
+                            if (raw[0] === '{') {
+                                data = JSON.parse(raw)
+                            }
+                            let origin = parse(data)
+                            if (isestr(origin)) {
+                                //origin可能為"1.2.3.4", "1.2.3.4:port", 或"::ffff:1.2.3.4"(部分環境如雲端runner為ipv4-mapped-ipv6), 取首個逗號前再正規化
+                                let ip = _normalizeIp(sep(origin, ',')[0])
+                                //須為合法IP才採用: 若來源回200但內容非IP(如被劫持或回HTML), 誤採為真實IP會使比對永遠不中而無聲放行全部代理
+                                if (net.isIP(ip) !== 0) {
+                                    myRealIp = ip
+                                }
+                            }
+                        }
+                        catch (err) {
+                            //換下一個來源
+                        }
+                        if (isestr(myRealIp)) {
+                            break
+                        }
                     }
                 }
-                catch (err) {
-                    //取不到就算了, 匿名性檢查會自動跳過
+                if (anonymityCheck &amp;&amp; !isestr(myRealIp)) {
+                    console.log('_fetchMyRealIp: unable to determine real ip, all proxies are rejected until it is available (anonymityCheck=true)')
                 }
                 myRealIpReady = true
             })()
@@ -246,20 +295,34 @@ function WIpProxy(opt = {}) {
         await myRealIpPm
     }
 
+    //LEAK_IP_HEADERS: 目標端若見到這些標頭且值含本機真實IP即為洩漏
+    let LEAK_IP_HEADERS = [
+        'x-forwarded-for', 'x-real-ip', 'x-client-ip', 'client-ip',
+        'true-client-ip', 'cf-connecting-ip', 'forwarded',
+        'x-originating-ip', 'x-cluster-client-ip',
+    ]
+
+    //LEAK_PROXY_HEADERS: 目標端若見到這些標頭即代表代理暴露自身存在, 非elite
+    let LEAK_PROXY_HEADERS = [
+        'via', 'proxy-connection', 'x-proxy-id',
+    ]
+
     async function _anonymityCheckCore(host, port) {
         if (!anonymityCheck) {
             return { ok: true }
         }
         if (!isestr(myRealIp)) {
-            return { ok: true } //沒抓到自己IP就無從比對, 放行
+            //沒抓到自己IP就無從驗證匿名性, 不放行未經驗證之代理(fail-closed)
+            return { ok: false, reason: 'anonymity unverifiable: real ip unknown' }
         }
-        let agent = new https.Agent({ rejectUnauthorized: false })
-        for (let i = 0; i &lt; anonymityCheckRepeats; i++) {
+        //單次檢測: 使用/get一次取得origin與目標端所見標頭, 同時檢查IP洩漏與代理暴露
+        let checkOnce = async () => {
             try {
-                let res = await axios.get('https://httpbin.org/ip', {
+                let res = await axios.get('https://httpbin.org/get', {
                     proxy: { host, port, protocol: 'http' },
-                    httpsAgent: agent,
-                    timeout: 5000,
+                    httpAgent: new http.Agent({ keepAlive: false }), //每次獨立連線, 避免keep-alive重用同一條連線而黏在負載平衡代理之同一後端, 使重複檢測失去獨立性
+                    httpsAgent: new https.Agent({ rejectUnauthorized: false, keepAlive: false }),
+                    ..._reqTimeout(5000),
                     headers: {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
                         'Accept': 'application/json',
@@ -270,15 +333,44 @@ function WIpProxy(opt = {}) {
                     return { ok: false, reason: `anonymity status[${res.status}]` }
                 }
                 let origin = get(res, 'data.origin', '')
-                if (!isestr(origin)) {
+                let headers = get(res, 'data.headers', null)
+                if (!isestr(origin) || !iseobj(headers)) {
                     return { ok: false, reason: 'anonymity non-json' }
                 }
                 if (_originHasIp(origin, myRealIp)) {
                     return { ok: false, reason: `leaks real IP` }
                 }
+                let hs = {}
+                each(headers, (v, k) => {
+                    hs[cstr(k).toLowerCase()] = cstr(v)
+                })
+                for (let k of LEAK_IP_HEADERS) {
+                    if (k in hs &amp;&amp; _originHasIp(hs[k], myRealIp)) {
+                        return { ok: false, reason: `leaks real IP via ${k}` }
+                    }
+                }
+                for (let k of LEAK_PROXY_HEADERS) {
+                    if (k in hs) {
+                        return { ok: false, reason: `exposes proxy via ${k}` }
+                    }
+                }
+                return { ok: true }
             }
             catch (err) {
                 return { ok: false, reason: trim(err.message || '') }
+            }
+        }
+
+        //重複檢測於時間上分散: 負載平衡型代理之洩漏常呈數秒級時間窗(實測67.203.23.79:8081約9成時間洩漏, 僅1~2s短暫正常窗), 同一瞬間之多次取樣會一起落入正常窗而整組放行, 故各次相隔anonymityCheckInterval送出且各用獨立連線
+        //採順序執行而非並發: _testProxiesCore對全部代理同時檢測, 若每個代理再並發多次取樣, 總連線數暴增(實測百餘代理×4次會使本機/CI大量請求逾時, 有效代理歸零), 順序執行使單一代理同時僅一個連線, 總並發維持在代理數量級
+        //任一次失敗(洩漏或連線失敗)即判定失敗並提前結束
+        for (let i = 0; i &lt; anonymityCheckRepeats; i++) {
+            if (i > 0) {
+                await new Promise((resolve) => setTimeout(resolve, anonymityCheckInterval))
+            }
+            let r = await checkOnce()
+            if (!r.ok) {
+                return r
             }
         }
         return { ok: true }
@@ -289,8 +381,8 @@ function WIpProxy(opt = {}) {
 
         try {
 
-            //res
-            let res = await axios.get(src)
+            //res, 直連proxyscrape, timeout生效; 設上限避免上游無回應時卡住整個getProxiesOnce
+            let res = await axios.get(src, { timeout: 15000 })
 
             //c
             let c = res.data
@@ -321,7 +413,7 @@ function WIpProxy(opt = {}) {
         return ps
     }
 
-    let b_getProxies = false
+    let pm_getProxies = null
     async function _getProxies() {
         // console.log('call getProxies...')
 
@@ -335,16 +427,16 @@ function WIpProxy(opt = {}) {
 
         }
 
-        //core
-        if (b_getProxies) {
-            return
+        //core, 若已有進行中之回合則共用同一promise, 讓呼叫端可等待其完成
+        if (pm_getProxies) {
+            return pm_getProxies
         }
-        b_getProxies = true
-        await core()
+        pm_getProxies = core()
             .catch(() => {}) //吃掉錯誤
             .finally(() => {
-                b_getProxies = false
+                pm_getProxies = null
             })
+        return pm_getProxies
 
     }
 
@@ -384,7 +476,7 @@ function WIpProxy(opt = {}) {
                     protocol: 'http',
                 },
                 httpsAgent: agent,
-                timeout: 5000,
+                ..._reqTimeout(5000),
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
                     'Accept': 'application/json',
@@ -459,7 +551,7 @@ function WIpProxy(opt = {}) {
         }
     }
 
-    let b_testProxies = false
+    let pm_testProxies = null
     async function _testProxies() {
         // console.log('call testProxies...')
 
@@ -488,16 +580,16 @@ function WIpProxy(opt = {}) {
 
         }
 
-        //core
-        if (b_testProxies) {
-            return
+        //core, 若已有進行中之回合則共用同一promise, 讓呼叫端可等待其完成
+        if (pm_testProxies) {
+            return pm_testProxies
         }
-        b_testProxies = true
-        await core()
+        pm_testProxies = core()
             .catch(() => {}) //吃掉錯誤
             .finally(() => {
-                b_testProxies = false
+                pm_testProxies = null
             })
+        return pm_testProxies
 
     }
 
@@ -547,7 +639,8 @@ function WIpProxy(opt = {}) {
     async function getProxiesOnce() {
         await _getProxies()
         await _testProxies()
-        let ps = await getProxies()
+        //本回合已完整結束, 直接回傳當前結果(可能為空陣列), 不可再用getProxies等待, 否則無有效代理時會等到waitFun逾時(約200s)才reject
+        let ps = values(kpPrx)
         return ps
     }
 
@@ -575,7 +668,7 @@ export default WIpProxy
 <br class="clear">
 
 <footer>
-    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 4.0.5</a> on Wed Sep 02 2026 18:06:41 GMT+0800 (台北標準時間) using the <a href="https://github.com/clenemt/docdash">docdash</a> theme.
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 4.0.5</a> on Sat Sep 05 2026 21:24:32 GMT+0800 (台北標準時間) using the <a href="https://github.com/clenemt/docdash">docdash</a> theme.
 </footer>
 
 <script>prettyPrint();</script>
